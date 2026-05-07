@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import gzip
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -9,31 +10,64 @@ from urllib.parse import urljoin, urlsplit
 
 import pandas as pd
 from lxml import html
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
 # ========== CONFIGURATION ==========
-# NAV_TIMEOUT_MS: Maximum time (in milliseconds) to wait for each page navigation.
-# HEADLESS: Run browser in headless mode (no GUI) if True.
-# MAX_HOSTS: Limit the number of hosts to process (useful for testing). None = all hosts.
-# MAX_CONCURRENT: Maximum number of hosts to scan simultaneously.
-# ====================================
 INPUT_CSV = "../Top list generator/data/merged_global_country_superlist.csv"
 OUTPUT_CSV = "csp_scan_results.csv"
+HTML_DIR = Path("html_pages") 
 NAV_TIMEOUT_MS = 30000
 HEADLESS = True
 MAX_HOSTS = 500
 MAX_CONCURRENT = 20
 
+# Realistic User-Agent for Chrome on Windows
+REAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+
+# Extra headers to look more like a real browser
+EXTRA_HEADERS = {
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
 csv_write_lock = asyncio.Lock()
+HTML_DIR.mkdir(exist_ok=True)          
+
+
+def save_html_gz(host: str, page_type: str, html_content: str) -> str:
+    """
+    Save HTML content as a gzipped file and return the relative file path.
+
+    Input:
+        host – hostname (used for filename)
+        page_type – "home" or "internal"
+        html_content – raw HTML string (may be empty)
+    Output:
+        relative file path (e.g., "html_pages/example_com_home.html.gz")
+        Returns empty string if html_content is empty.
+    """
+    if not html_content:
+        return ""
+    # Sanitize host for safe filename
+    safe_host = host.replace(".", "_").replace("/", "_")
+    filename = f"{safe_host}_{page_type}.html.gz"
+    filepath = HTML_DIR / filename
+    # Write compressed
+    with gzip.open(filepath, "wt", encoding="utf-8") as f:
+        f.write(html_content)
+    return str(filepath)
 
 
 def normalize_host(host: str) -> str:
     """
-    Normalize a hostname: strip whitespace, convert to lowercase, remove trailing dot.
-    
-    Input: host (str) – raw hostname from CSV.
-    Returns: Cleaned hostname as string.
-    Raises: ValueError if input is empty after normalisation.
+    Normalize a hostname for consistent processing.
+
+    Input:  raw host string (e.g., "Example.com/", " WWW.EXAMPLE.COM.")
+    Output: lowercase stripped host without trailing dot (e.g., "example.com")
+    Raises ValueError if the input is empty after stripping.
     """
     s = str(host).strip().lower().rstrip(".")
     if not s:
@@ -43,11 +77,11 @@ def normalize_host(host: str) -> str:
 
 def is_probably_html_path(url: str) -> bool:
     """
-    Determine whether a URL path likely points to an HTML page (not a binary file).
-    
-    Input: url (str) – full URL.
-    Returns: True if the path has no extension or ends with a common HTML‑related extension,
-             False if it ends with a known binary / non‑HTML extension (e.g. .jpg, .pdf, .js).
+    Determine whether a URL path likely points to an HTML resource.
+
+    Input:  absolute or relative URL string.
+    Output: True if the path ends with '/' or has no extension / an HTML‑like extension;
+            False if it ends with a binary/static file extension.
     """
     path = urlsplit(url).path.lower()
     if not path or path.endswith("/"):
@@ -62,45 +96,14 @@ def is_probably_html_path(url: str) -> bool:
     return not any(path.endswith(ext) for ext in bad_exts)
 
 
-def extract_meta_csp(html_text: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    Extract CSP and CSP‑report‑only from <meta http-equiv> tags in the HTML.
-    
-    Input:
-      - html_text (str): The HTML source.
-    Returns:
-      Tuple (csp, csp_report_only) where each is the content attribute value or None.
-    """
-    try:
-        tree = html.fromstring(html_text)
-    except Exception:
-        return None, None
-    
-    csp = None
-    csp_report_only = None
-    
-    # Find all meta tags with http-equiv attribute
-    for meta in tree.xpath("//meta[@http-equiv]"):
-        equiv = meta.get("http-equiv", "").lower()
-        content = meta.get("content")
-        if not content:
-            continue
-        if equiv == "content-security-policy":
-            csp = content
-        elif equiv == "content-security-policy-report-only":
-            csp_report_only = content
-    return csp, csp_report_only
-
-
 def extract_first_same_host_internal_html_link(page_url: str, html_text: str) -> Optional[str]:
     """
-    Extract the first internal HTML link that belongs to the same host as the page URL.
-    
-    Input:
-      - page_url (str): The URL of the page being parsed.
-      - html_text (str): The HTML source of that page.
-    Returns:
-      The absolute URL of the first suitable internal link, or None if none found.
+    Find the first internal (same‑host) HTML link on a page that is suitable for a second scan.
+
+    Input:  page_url – the URL of the page being analysed.
+            html_text – the HTML content of that page.
+    Output: absolute URL of the first qualifying internal link, or None if none found.
+            Excludes fragment links, non‑HTML paths, logout/cart/checkout pages, and the current page itself.
     """
     try:
         tree = html.fromstring(html_text)
@@ -143,19 +146,17 @@ def extract_first_same_host_internal_html_link(page_url: str, html_text: str) ->
 
 async def nav_and_collect(page, url: str) -> Dict[str, Any]:
     """
-    Navigate to a URL and collect response data.
-    
-    Input:
-      - page: Playwright Page object.
-      - url (str): The URL to navigate to.
-    Returns:
-      Dict containing:
-        - requested_url
-        - final_url (after redirects)
-        - status (HTTP status code)
-        - headers (all response headers as dict)
-        - html (full page HTML source)
-    Raises: RuntimeError if no main document response is received.
+    Navigate a Playwright page to a URL and collect response data.
+
+    Input:  page – Playwright Page object.
+            url – target URL.
+    Output: dict containing:
+            - requested_url: original URL
+            - final_url: URL after any redirects
+            - status: HTTP status code
+            - headers: dictionary of response headers
+            - html: full page HTML source
+    Raises RuntimeError if no response object is obtained.
     """
     response = await page.goto(url, wait_until="load", timeout=NAV_TIMEOUT_MS)
     if response is None:
@@ -175,14 +176,12 @@ async def nav_and_collect(page, url: str) -> Dict[str, Any]:
 async def try_homepage(page, host: str) -> Dict[str, Any]:
     """
     Attempt to load the homepage of a host, trying HTTPS first, then HTTP.
-    
-    Input:
-      - page: Playwright Page object.
-      - host (str): The hostname (e.g. "example.com").
-    Returns:
-      The dictionary returned by nav_and_collect() for the successful scheme,
-      plus an extra key "homepage_attempt_scheme" indicating which scheme worked.
-    Raises: RuntimeError if both HTTPS and HTTP attempts fail.
+
+    Input:  page – Playwright Page object.
+            host – hostname (e.g., "example.com").
+    Output: navigation result dict from nav_and_collect() for the first successful scheme.
+            Additional key "homepage_attempt_scheme" indicates which scheme worked.
+    Raises RuntimeError if both HTTPS and HTTP attempts fail.
     """
     errors = []
     for scheme in ("https", "http"):
@@ -198,23 +197,33 @@ async def try_homepage(page, host: str) -> Dict[str, Any]:
 
 async def scan_one_host(browser, host: str, rank: Optional[int] = None, country: Optional[str] = None) -> Dict[str, Any]:
     """
-    Scan a single host: load homepage, find an internal link, load that internal page.
+    Scan a single host: load homepage, save HTML, then load one internal page.
 
-    Input:
-      - browser: Playwright Browser object.
-      - host (str): Hostname to scan.
-      - rank (int, optional): Rank from input CSV.
-      - country (str, optional): Country from input CSV.
-    Returns:
-      Dict with keys that match the current `output_headers` defined in main().
+    Input:  browser – Playwright Browser object.
+            host – hostname to scan.
+            rank – optional rank from input list (for output).
+            country – optional country code (for output).
+    Output: dict containing scan results (homepage data, internal page data, HTML file paths, errors).
+            Keys follow the CSV output schema.
     """
-    context = await browser.new_context(ignore_https_errors=False)
+    context = await browser.new_context(
+        ignore_https_errors=False,
+        user_agent=REAL_UA,
+        viewport={"width": 1920, "height": 1080},
+        extra_http_headers=EXTRA_HEADERS,
+    )
     page = await context.new_page()
+    
+    # Disable automation detection flags
+    await page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+        window.chrome = {runtime: {}};
+    """)
+
     try:
         homepage = await try_homepage(page, host)
-
-        # Extract meta CSP from homepage HTML
-        homepage_meta_csp, homepage_meta_csp_report_only = extract_meta_csp(homepage["html"])
+        homepage_html_file = save_html_gz(host, "home", homepage["html"])
 
         first_internal = extract_first_same_host_internal_html_link(
             homepage["final_url"],
@@ -222,12 +231,11 @@ async def scan_one_host(browser, host: str, rank: Optional[int] = None, country:
         )
 
         internal = None
-        internal_meta_csp = None
-        internal_meta_csp_report_only = None
+        internal_html_file = ""
         if first_internal:
             try:
                 internal = await nav_and_collect(page, first_internal)
-                internal_meta_csp, internal_meta_csp_report_only = extract_meta_csp(internal["html"])
+                internal_html_file = save_html_gz(host, "internal", internal["html"])
             except Exception as e:
                 internal = {
                     "requested_url": first_internal,
@@ -237,7 +245,6 @@ async def scan_one_host(browser, host: str, rank: Optional[int] = None, country:
                     "html": None,
                     "error": f"{type(e).__name__}: {e}",
                 }
-                # meta CSP remains None
 
         return {
             "rank": rank,
@@ -246,13 +253,11 @@ async def scan_one_host(browser, host: str, rank: Optional[int] = None, country:
             "homepage_final_url": homepage["final_url"],
             "homepage_status": homepage["status"],
             "homepage_all_headers": json.dumps(homepage["headers"]),
-            "homepage_meta_csp": homepage_meta_csp,
-            "homepage_meta_csp_report_only": homepage_meta_csp_report_only,
+            "homepage_html_file": homepage_html_file,
             "first_internal_final_url": None if internal is None else internal["final_url"],
             "first_internal_status": None if internal is None else internal["status"],
             "first_internal_all_headers": json.dumps(internal["headers"]) if internal else None,
-            "first_internal_meta_csp": internal_meta_csp,
-            "first_internal_meta_csp_report_only": internal_meta_csp_report_only,
+            "first_internal_html_file": internal_html_file,
             "error": None,
         }
     except Exception as e:
@@ -263,13 +268,11 @@ async def scan_one_host(browser, host: str, rank: Optional[int] = None, country:
             "homepage_final_url": None,
             "homepage_status": None,
             "homepage_all_headers": None,
-            "homepage_meta_csp": None,
-            "homepage_meta_csp_report_only": None,
+            "homepage_html_file": "",
             "first_internal_final_url": None,
             "first_internal_status": None,
             "first_internal_all_headers": None,
-            "first_internal_meta_csp": None,
-            "first_internal_meta_csp_report_only": None,
+            "first_internal_html_file": "",
             "error": f"{type(e).__name__}: {e}",
         }
     finally:
@@ -278,12 +281,11 @@ async def scan_one_host(browser, host: str, rank: Optional[int] = None, country:
 
 async def write_result_row(result: Dict[str, Any], headers: list):
     """
-    Append one result row to the output CSV file in a thread‑safe manner.
-    
-    Input:
-      - result (dict): The result dictionary for a single host.
-      - headers (list): The column names (order) to use in the CSV.
-    Returns: None.
+    Append one result row to the CSV output file. Thread‑safe using a lock.
+
+    Input:  result – dictionary with keys matching CSV headers.
+            headers – list of column names (order must match result keys).
+    Output: None (writes to file, creates header if file is new/empty).
     """
     async with csv_write_lock:
         file_exists = Path(OUTPUT_CSV).is_file()
@@ -298,12 +300,10 @@ async def write_result_row(result: Dict[str, Any], headers: list):
 
 def get_successful_hosts() -> set:
     """
-    Read the existing output CSV and return a set of hosts that have at least one successful scan.
-    
-    A scan is considered successful if the 'error' column is empty.
-    
-    Input: None.
-    Returns: set of hostnames (strings) that have a successful entry in the CSV.
+    Read the existing output CSV and return a set of hostnames that have already been scanned without error.
+
+    Input:  None (reads OUTPUT_CSV from disk).
+    Output: set of host strings (normalised) that have an empty 'error' field.
     """
     if not Path(OUTPUT_CSV).is_file():
         return set()
@@ -321,17 +321,8 @@ def get_successful_hosts() -> set:
 
 async def main():
     """
-    Main asynchronous entry point.
-    
-    Workflow:
-      1. Read input CSV and normalise hostnames.
-      2. Determine which hosts have already been successfully scanned (skip them).
-      3. Prepare output CSV headers (JSON of all headers, no separate CSP header columns).
-      4. Launch Playwright browser.
-      5. Use a semaphore to limit concurrency (MAX_CONCURRENT).
-      6. Create tasks for each pending host and run them concurrently.
-      7. Handle graceful shutdown on Ctrl+C.
-      8. Print final summary.
+    Main entry point: read input CSV, filter already scanned hosts, launch browser with stealth args,
+    scan hosts concurrently with rate limiting, write results incrementally, and save HTML as gzipped files.
     """
     df = pd.read_csv(INPUT_CSV)
     if MAX_HOSTS is not None:
@@ -347,9 +338,11 @@ async def main():
     output_headers = [
         "rank", "host", "country",
         "homepage_final_url", "homepage_status",
-        "homepage_all_headers", "homepage_meta_csp", "homepage_meta_csp_report_only",
+        "homepage_all_headers",
+        "homepage_html_file",
         "first_internal_final_url", "first_internal_status",
-        "first_internal_all_headers", "first_internal_meta_csp", "first_internal_meta_csp_report_only",
+        "first_internal_all_headers",
+        "first_internal_html_file",
         "error"
     ]
 
@@ -357,7 +350,15 @@ async def main():
     print(f"Hosts to scan (pending): {total} (already successful: {len(successful_hosts)})")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS)
+        browser = await p.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--no-sandbox",
+                "--disable-dev-shm-usage"
+            ]
+        )
         semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
         async def bounded_scan(row):
