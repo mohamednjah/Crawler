@@ -13,12 +13,12 @@ from lxml import html
 from playwright.async_api import async_playwright
 
 # ========== CONFIGURATION ==========
-INPUT_CSV = "../Top list generator/data/merged_global_country_superlist.csv"
+INPUT_CSV = "superlist/merged_global_country_superlist.csv"
 OUTPUT_CSV = "csp_scan_results.csv"
 HTML_DIR = Path("html_pages") 
 NAV_TIMEOUT_MS = 30000
 HEADLESS = True
-MAX_HOSTS = 500
+MAX_HOSTS = None
 MAX_CONCURRENT = 20
 
 # Realistic User-Agent for Chrome on Windows
