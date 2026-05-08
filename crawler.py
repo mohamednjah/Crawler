@@ -4,6 +4,7 @@ import asyncio
 import csv
 import gzip
 import json
+from collections import deque
 from pathlib import Path
 from typing import Dict, Any, Optional
 from urllib.parse import urljoin, urlsplit
@@ -19,7 +20,7 @@ HTML_DIR = Path("html_pages")
 NAV_TIMEOUT_MS = 30000
 HEADLESS = True
 MAX_HOSTS = None
-MAX_CONCURRENT = 20
+MAX_CONCURRENT = 40
 
 # Realistic User-Agent for Chrome on Windows
 REAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
@@ -34,41 +35,41 @@ EXTRA_HEADERS = {
 }
 
 csv_write_lock = asyncio.Lock()
-HTML_DIR.mkdir(exist_ok=True)          
+HTML_DIR.mkdir(exist_ok=True)
 
+# ---------- Progress tracking ----------
+total_scanned = 0
+total_success = 0
+total_failed = 0
+last_errors = deque(maxlen=500)      # store last 500 error messages
+progress_lock = asyncio.Lock()
+
+def update_progress(success: bool, host: str, error_msg: str = ""):
+    global total_scanned, total_success, total_failed, last_errors
+    total_scanned += 1
+    if success:
+        total_success += 1
+    else:
+        total_failed += 1
+        if error_msg:
+            last_errors.append(f"{host}: {error_msg}")
+    # Print progress after each host (or change to every 10/100 for less noise)
+    print(f"[{total_scanned}] Success: {total_success} | Failed: {total_failed} | Last host: {host}")
+
+# --------------------------------------
 
 def save_html_gz(host: str, page_type: str, html_content: str) -> str:
-    """
-    Save HTML content as a gzipped file and return the relative file path.
-
-    Input:
-        host – hostname (used for filename)
-        page_type – "home" or "internal"
-        html_content – raw HTML string (may be empty)
-    Output:
-        relative file path (e.g., "html_pages/example_com_home.html.gz")
-        Returns empty string if html_content is empty.
-    """
     if not html_content:
         return ""
-    # Sanitize host for safe filename
     safe_host = host.replace(".", "_").replace("/", "_")
     filename = f"{safe_host}_{page_type}.html.gz"
     filepath = HTML_DIR / filename
-    # Write compressed
     with gzip.open(filepath, "wt", encoding="utf-8") as f:
         f.write(html_content)
     return str(filepath)
 
 
 def normalize_host(host: str) -> str:
-    """
-    Normalize a hostname for consistent processing.
-
-    Input:  raw host string (e.g., "Example.com/", " WWW.EXAMPLE.COM.")
-    Output: lowercase stripped host without trailing dot (e.g., "example.com")
-    Raises ValueError if the input is empty after stripping.
-    """
     s = str(host).strip().lower().rstrip(".")
     if not s:
         raise ValueError("empty host")
@@ -76,13 +77,6 @@ def normalize_host(host: str) -> str:
 
 
 def is_probably_html_path(url: str) -> bool:
-    """
-    Determine whether a URL path likely points to an HTML resource.
-
-    Input:  absolute or relative URL string.
-    Output: True if the path ends with '/' or has no extension / an HTML‑like extension;
-            False if it ends with a binary/static file extension.
-    """
     path = urlsplit(url).path.lower()
     if not path or path.endswith("/"):
         return True
@@ -97,14 +91,6 @@ def is_probably_html_path(url: str) -> bool:
 
 
 def extract_first_same_host_internal_html_link(page_url: str, html_text: str) -> Optional[str]:
-    """
-    Find the first internal (same‑host) HTML link on a page that is suitable for a second scan.
-
-    Input:  page_url – the URL of the page being analysed.
-            html_text – the HTML content of that page.
-    Output: absolute URL of the first qualifying internal link, or None if none found.
-            Excludes fragment links, non‑HTML paths, logout/cart/checkout pages, and the current page itself.
-    """
     try:
         tree = html.fromstring(html_text)
     except Exception:
@@ -145,19 +131,6 @@ def extract_first_same_host_internal_html_link(page_url: str, html_text: str) ->
 
 
 async def nav_and_collect(page, url: str) -> Dict[str, Any]:
-    """
-    Navigate a Playwright page to a URL and collect response data.
-
-    Input:  page – Playwright Page object.
-            url – target URL.
-    Output: dict containing:
-            - requested_url: original URL
-            - final_url: URL after any redirects
-            - status: HTTP status code
-            - headers: dictionary of response headers
-            - html: full page HTML source
-    Raises RuntimeError if no response object is obtained.
-    """
     response = await page.goto(url, wait_until="load", timeout=NAV_TIMEOUT_MS)
     if response is None:
         raise RuntimeError(f"No main-document response for {url!r}")
@@ -174,15 +147,6 @@ async def nav_and_collect(page, url: str) -> Dict[str, Any]:
 
 
 async def try_homepage(page, host: str) -> Dict[str, Any]:
-    """
-    Attempt to load the homepage of a host, trying HTTPS first, then HTTP.
-
-    Input:  page – Playwright Page object.
-            host – hostname (e.g., "example.com").
-    Output: navigation result dict from nav_and_collect() for the first successful scheme.
-            Additional key "homepage_attempt_scheme" indicates which scheme worked.
-    Raises RuntimeError if both HTTPS and HTTP attempts fail.
-    """
     errors = []
     for scheme in ("https", "http"):
         url = f"{scheme}://{host}/"
@@ -196,16 +160,6 @@ async def try_homepage(page, host: str) -> Dict[str, Any]:
 
 
 async def scan_one_host(browser, host: str, rank: Optional[int] = None, country: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Scan a single host: load homepage, save HTML, then load one internal page.
-
-    Input:  browser – Playwright Browser object.
-            host – hostname to scan.
-            rank – optional rank from input list (for output).
-            country – optional country code (for output).
-    Output: dict containing scan results (homepage data, internal page data, HTML file paths, errors).
-            Keys follow the CSV output schema.
-    """
     context = await browser.new_context(
         ignore_https_errors=False,
         user_agent=REAL_UA,
@@ -213,8 +167,6 @@ async def scan_one_host(browser, host: str, rank: Optional[int] = None, country:
         extra_http_headers=EXTRA_HEADERS,
     )
     page = await context.new_page()
-    
-    # Disable automation detection flags
     await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
@@ -261,6 +213,7 @@ async def scan_one_host(browser, host: str, rank: Optional[int] = None, country:
             "error": None,
         }
     except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
         return {
             "rank": rank,
             "host": host,
@@ -273,20 +226,13 @@ async def scan_one_host(browser, host: str, rank: Optional[int] = None, country:
             "first_internal_status": None,
             "first_internal_all_headers": None,
             "first_internal_html_file": "",
-            "error": f"{type(e).__name__}: {e}",
+            "error": error_msg,
         }
     finally:
         await context.close()
 
 
 async def write_result_row(result: Dict[str, Any], headers: list):
-    """
-    Append one result row to the CSV output file. Thread‑safe using a lock.
-
-    Input:  result – dictionary with keys matching CSV headers.
-            headers – list of column names (order must match result keys).
-    Output: None (writes to file, creates header if file is new/empty).
-    """
     async with csv_write_lock:
         file_exists = Path(OUTPUT_CSV).is_file()
         if not file_exists or Path(OUTPUT_CSV).stat().st_size == 0:
@@ -299,12 +245,6 @@ async def write_result_row(result: Dict[str, Any], headers: list):
 
 
 def get_successful_hosts() -> set:
-    """
-    Read the existing output CSV and return a set of hostnames that have already been scanned without error.
-
-    Input:  None (reads OUTPUT_CSV from disk).
-    Output: set of host strings (normalised) that have an empty 'error' field.
-    """
     if not Path(OUTPUT_CSV).is_file():
         return set()
     successful = set()
@@ -320,10 +260,8 @@ def get_successful_hosts() -> set:
 
 
 async def main():
-    """
-    Main entry point: read input CSV, filter already scanned hosts, launch browser with stealth args,
-    scan hosts concurrently with rate limiting, write results incrementally, and save HTML as gzipped files.
-    """
+    global total_scanned, total_success, total_failed, last_errors
+
     df = pd.read_csv(INPUT_CSV)
     if MAX_HOSTS is not None:
         df = df.head(MAX_HOSTS).copy()
@@ -346,8 +284,9 @@ async def main():
         "error"
     ]
 
-    total = len(df)
-    print(f"Hosts to scan (pending): {total} (already successful: {len(successful_hosts)})")
+    total_to_scan = len(df)
+    print(f"Hosts to scan (pending): {total_to_scan} (already successful: {len(successful_hosts)})")
+    print(f"Starting scan with concurrency {MAX_CONCURRENT}...\n")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -366,25 +305,66 @@ async def main():
                 host = row["host"]
                 rank = row.get("rank")
                 country = row.get("country")
-                print(f"Starting scan: {host}")
-                result = await scan_one_host(browser, host, rank=rank, country=country)
-                await write_result_row(result, output_headers)
-                print(f"Finished: {host} (success={result['error'] is None})")
-                return result
+                try:
+                    result = await scan_one_host(browser, host, rank=rank, country=country)
+                    await write_result_row(result, output_headers)
+                    is_success = (result["error"] is None)
+                    update_progress(is_success, host, result["error"] if not is_success else "")
+                except Exception as e:
+                    # In case scan_one_host itself raises an unhandled exception
+                    error_msg = f"UNHANDLED: {type(e).__name__}: {e}"
+                    update_progress(False, host, error_msg)
+                    # Write a minimal error row
+                    error_row = {
+                        "rank": rank,
+                        "host": host,
+                        "country": country,
+                        "homepage_final_url": None,
+                        "homepage_status": None,
+                        "homepage_all_headers": None,
+                        "homepage_html_file": "",
+                        "first_internal_final_url": None,
+                        "first_internal_status": None,
+                        "first_internal_all_headers": None,
+                        "first_internal_html_file": "",
+                        "error": error_msg,
+                    }
+                    await write_result_row(error_row, output_headers)
+                return
 
         tasks = [asyncio.create_task(bounded_scan(row)) for _, row in df.iterrows()]
 
         try:
             await asyncio.gather(*tasks)
         except KeyboardInterrupt:
-            print("\nInterrupt received – shutting down gracefully...")
+            print("\n\n⚠️ Interrupt received – shutting down gracefully...")
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             await browser.close()
-            print("Partial results saved to", OUTPUT_CSV)
+            # Print final summary
+            print("\n========== FINAL SUMMARY ==========")
+            print(f"Total scanned: {total_scanned}")
+            print(f"Successful: {total_success}")
+            print(f"Failed: {total_failed}")
+            if last_errors:
+                print("\n--- Last 500 errors ---")
+                for err in last_errors:
+                    print(err)
+            else:
+                print("No errors recorded.")
+            print(f"Partial results saved to {OUTPUT_CSV}")
+            return
 
-    print(f"All scans complete. Results saved to {OUTPUT_CSV}")
+    print("\n========== SCAN COMPLETE ==========")
+    print(f"Total scanned: {total_scanned}")
+    print(f"Successful: {total_success}")
+    print(f"Failed: {total_failed}")
+    if last_errors:
+        print("\n--- Last 500 errors ---")
+        for err in last_errors:
+            print(err)
+    print(f"All results saved to {OUTPUT_CSV}")
 
 
 if __name__ == "__main__":
