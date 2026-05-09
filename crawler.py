@@ -247,7 +247,10 @@ async def write_result_row(result: Dict[str, Any], headers: list):
 def get_successful_hosts() -> set:
     if not Path(OUTPUT_CSV).is_file():
         return set()
-    successful = set()
+
+    hosts_with_success = set()          # hosts with at least one error‑free row
+    error_attempt_counts = {}           # host -> number of attempts that ended in an error
+
     with open(OUTPUT_CSV, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -255,8 +258,16 @@ def get_successful_hosts() -> set:
             if not host:
                 continue
             if not row.get("error"):
-                successful.add(host)
-    return successful
+                hosts_with_success.add(host)
+            else:
+                error_attempt_counts[host] = error_attempt_counts.get(host, 0) + 1
+
+    # Also treat hosts with at least 5 failed attempts as "successful" to stop retrying them
+    for host, count in error_attempt_counts.items():
+        if host not in hosts_with_success and count >= 5:
+            hosts_with_success.add(host)
+
+    return hosts_with_success
 
 
 async def main():
