@@ -21,6 +21,7 @@ NAV_TIMEOUT_MS = 30000
 HEADLESS = True
 MAX_HOSTS = None
 MAX_CONCURRENT = 30
+BROWSER_RESTART_INTERVAL = 500        # restart browser after this many hosts
 
 # Realistic User-Agent for Chrome on Windows
 REAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
@@ -53,7 +54,7 @@ def update_progress(success: bool, host: str, error_msg: str = ""):
         total_failed += 1
         if error_msg:
             last_errors.append(f"{host}: {error_msg}")
-    # Print progress after each host (or change to every 10/100 for less noise)
+    # Print progress after each host
     print(f"[{total_scanned}] Success: {total_success} | Failed: {total_failed} | Last host: {host}")
 
 # --------------------------------------
@@ -262,7 +263,7 @@ def get_successful_hosts() -> set:
             else:
                 error_attempt_counts[host] = error_attempt_counts.get(host, 0) + 1
 
-    # Also treat hosts with at least 5 failed attempts as "successful" to stop retrying them
+    # Also treat hosts with at least 3 failed attempts as "successful" to stop retrying them
     for host, count in error_attempt_counts.items():
         if host not in hosts_with_success and count >= 3:
             hosts_with_success.add(host)
@@ -297,76 +298,66 @@ async def main():
 
     total_to_scan = len(df)
     print(f"Hosts to scan (pending): {total_to_scan} (already successful: {len(successful_hosts)})")
-    print(f"Starting scan with concurrency {MAX_CONCURRENT}...\n")
+    print(f"Starting scan with concurrency {MAX_CONCURRENT}, "
+          f"browser restarts every {BROWSER_RESTART_INTERVAL} hosts...\n")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=HEADLESS,
-            executable_path="/snap/bin/chromium",
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--no-sandbox",
-                "--disable-dev-shm-usage"
-            ]
-        )
         semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-        async def bounded_scan(row):
-            async with semaphore:
-                host = row["host"]
-                rank = row.get("rank")
-                country = row.get("country")
-                try:
-                    result = await scan_one_host(browser, host, rank=rank, country=country)
-                    await write_result_row(result, output_headers)
-                    is_success = (result["error"] is None)
-                    update_progress(is_success, host, result["error"] if not is_success else "")
-                except Exception as e:
-                    # In case scan_one_host itself raises an unhandled exception
-                    error_msg = f"UNHANDLED: {type(e).__name__}: {e}"
-                    update_progress(False, host, error_msg)
-                    # Write a minimal error row
-                    error_row = {
-                        "rank": rank,
-                        "host": host,
-                        "country": country,
-                        "homepage_final_url": None,
-                        "homepage_status": None,
-                        "homepage_all_headers": None,
-                        "homepage_html_file": "",
-                        "first_internal_final_url": None,
-                        "first_internal_status": None,
-                        "first_internal_all_headers": None,
-                        "first_internal_html_file": "",
-                        "error": error_msg,
-                    }
-                    await write_result_row(error_row, output_headers)
-                return
+        # Process in chunks to restart browser periodically
+        for chunk_start in range(0, len(df), BROWSER_RESTART_INTERVAL):
+            chunk_df = df.iloc[chunk_start:chunk_start + BROWSER_RESTART_INTERVAL]
+            print(f"\n--- Processing chunk {chunk_start // BROWSER_RESTART_INTERVAL + 1} "
+                  f"({len(chunk_df)} hosts) ---")
 
-        tasks = [asyncio.create_task(bounded_scan(row)) for _, row in df.iterrows()]
+            # Launch a fresh browser for this chunk
+            browser = await p.chromium.launch(
+                headless=HEADLESS,
+                executable_path="/snap/bin/chromium",   # adjust to your Chromium path, or remove for Playwright's built‑in
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage"
+                ]
+            )
 
-        try:
+            async def bounded_scan(row):
+                async with semaphore:
+                    host = row["host"]
+                    rank = row.get("rank")
+                    country = row.get("country")
+                    try:
+                        result = await scan_one_host(browser, host, rank=rank, country=country)
+                        await write_result_row(result, output_headers)
+                        is_success = (result["error"] is None)
+                        update_progress(is_success, host, result["error"] if not is_success else "")
+                    except Exception as e:
+                        error_msg = f"UNHANDLED: {type(e).__name__}: {e}"
+                        update_progress(False, host, error_msg)
+                        error_row = {
+                            "rank": rank,
+                            "host": host,
+                            "country": country,
+                            "homepage_final_url": None,
+                            "homepage_status": None,
+                            "homepage_all_headers": None,
+                            "homepage_html_file": "",
+                            "first_internal_final_url": None,
+                            "first_internal_status": None,
+                            "first_internal_all_headers": None,
+                            "first_internal_html_file": "",
+                            "error": error_msg,
+                        }
+                        await write_result_row(error_row, output_headers)
+                    return
+
+            tasks = [asyncio.create_task(bounded_scan(row)) for _, row in chunk_df.iterrows()]
             await asyncio.gather(*tasks)
-        except KeyboardInterrupt:
-            print("\n\n⚠️ Interrupt received – shutting down gracefully...")
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Close the browser after finishing this chunk
             await browser.close()
-            # Print final summary
-            print("\n========== FINAL SUMMARY ==========")
-            print(f"Total scanned: {total_scanned}")
-            print(f"Successful: {total_success}")
-            print(f"Failed: {total_failed}")
-            if last_errors:
-                print("\n--- Last 500 errors ---")
-                for err in last_errors:
-                    print(err)
-            else:
-                print("No errors recorded.")
-            print(f"Partial results saved to {OUTPUT_CSV}")
-            return
+            print(f"--- Finished chunk, browser closed. ---")
 
     print("\n========== SCAN COMPLETE ==========")
     print(f"Total scanned: {total_scanned}")
