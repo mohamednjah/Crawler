@@ -359,9 +359,15 @@ async def main():
                     return
 
             tasks = [asyncio.create_task(bounded_scan(row)) for _, row in chunk_df.iterrows()]
-            await asyncio.gather(*tasks)
+            try:
+                await asyncio.gather(*tasks)
+            except Exception as e:
+                print(f"⚠️  Chunk gather error: {type(e).__name__}: {e}")
 
-            await browser.close()
+            try:
+                await browser.close()
+            except Exception:
+                pass
             print(f"--- Finished chunk, browser closed. ---")
 
     print("\n========== SCAN COMPLETE ==========")
