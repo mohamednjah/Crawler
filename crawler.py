@@ -23,6 +23,10 @@ MAX_HOSTS = None
 MAX_CONCURRENT = 30
 BROWSER_RESTART_INTERVAL = 500        # restart browser after this many hosts
 
+# Hard outer timeout (seconds) applied per host via asyncio.wait_for.
+# Should be larger than NAV_TIMEOUT_MS * 2 to allow for homepage + internal page.
+HOST_HARD_TIMEOUT_S = 90
+
 # Realistic User-Agent for Chrome on Windows
 REAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 
@@ -54,7 +58,6 @@ def update_progress(success: bool, host: str, error_msg: str = ""):
         total_failed += 1
         if error_msg:
             last_errors.append(f"{host}: {error_msg}")
-    # Print progress after each host
     print(f"[{total_scanned}] Success: {total_success} | Failed: {total_failed} | Last host: {host}")
 
 # --------------------------------------
@@ -132,7 +135,9 @@ def extract_first_same_host_internal_html_link(page_url: str, html_text: str) ->
 
 
 async def nav_and_collect(page, url: str) -> Dict[str, Any]:
-    response = await page.goto(url, wait_until="load", timeout=NAV_TIMEOUT_MS)
+    # Use domcontentloaded instead of load — fires reliably even on pages
+    # that never finish loading all resources (which can stall "load" forever).
+    response = await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     if response is None:
         raise RuntimeError(f"No main-document response for {url!r}")
     headers = await response.all_headers()
@@ -158,6 +163,23 @@ async def try_homepage(page, host: str) -> Dict[str, Any]:
         except Exception as e:
             errors.append(f"{scheme}: {type(e).__name__}: {e}")
     raise RuntimeError(" ; ".join(errors))
+
+
+def _make_error_result(rank, host, country, error_msg: str) -> Dict[str, Any]:
+    return {
+        "rank": rank,
+        "host": host,
+        "country": country,
+        "homepage_final_url": None,
+        "homepage_status": None,
+        "homepage_all_headers": None,
+        "homepage_html_file": "",
+        "first_internal_final_url": None,
+        "first_internal_status": None,
+        "first_internal_all_headers": None,
+        "first_internal_html_file": "",
+        "error": error_msg,
+    }
 
 
 async def scan_one_host(browser, host: str, rank: Optional[int] = None, country: Optional[str] = None) -> Dict[str, Any]:
@@ -215,22 +237,12 @@ async def scan_one_host(browser, host: str, rank: Optional[int] = None, country:
         }
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}"
-        return {
-            "rank": rank,
-            "host": host,
-            "country": country,
-            "homepage_final_url": None,
-            "homepage_status": None,
-            "homepage_all_headers": None,
-            "homepage_html_file": "",
-            "first_internal_final_url": None,
-            "first_internal_status": None,
-            "first_internal_all_headers": None,
-            "first_internal_html_file": "",
-            "error": error_msg,
-        }
+        return _make_error_result(rank, host, country, error_msg)
     finally:
-        await context.close()
+        try:
+            await context.close()
+        except Exception:
+            pass
 
 
 async def write_result_row(result: Dict[str, Any], headers: list):
@@ -249,7 +261,7 @@ def get_successful_hosts() -> set:
     if not Path(OUTPUT_CSV).is_file():
         return set()
 
-    hosts_with_success = set()          # hosts with at least one error‑free row
+    hosts_with_success = set()          # hosts with at least one error-free row
     error_attempt_counts = {}           # host -> number of attempts that ended in an error
 
     with open(OUTPUT_CSV, "r", encoding="utf-8") as f:
@@ -263,7 +275,7 @@ def get_successful_hosts() -> set:
             else:
                 error_attempt_counts[host] = error_attempt_counts.get(host, 0) + 1
 
-    # Also treat hosts with at least 3 failed attempts as "successful" to stop retrying them
+    # Also treat hosts with 3+ failed attempts as done to stop retrying them
     for host, count in error_attempt_counts.items():
         if host not in hosts_with_success and count >= 3:
             hosts_with_success.add(host)
@@ -304,16 +316,13 @@ async def main():
     async with async_playwright() as p:
         semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-        # Process in chunks to restart browser periodically
         for chunk_start in range(0, len(df), BROWSER_RESTART_INTERVAL):
             chunk_df = df.iloc[chunk_start:chunk_start + BROWSER_RESTART_INTERVAL]
             print(f"\n--- Processing chunk {chunk_start // BROWSER_RESTART_INTERVAL + 1} "
                   f"({len(chunk_df)} hosts) ---")
 
-            # Launch a fresh browser for this chunk
             browser = await p.chromium.launch(
                 headless=HEADLESS,
-                executable_path="/snap/bin/chromium",   # adjust to your Chromium path, or remove for Playwright's built‑in
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--disable-features=IsolateOrigins,site-per-process",
@@ -328,34 +337,29 @@ async def main():
                     rank = row.get("rank")
                     country = row.get("country")
                     try:
-                        result = await scan_one_host(browser, host, rank=rank, country=country)
+                        # Hard outer timeout — guards against Playwright's own
+                        # timeout silently failing on certain stuck pages.
+                        result = await asyncio.wait_for(
+                            scan_one_host(browser, host, rank=rank, country=country),
+                            timeout=HOST_HARD_TIMEOUT_S,
+                        )
                         await write_result_row(result, output_headers)
                         is_success = (result["error"] is None)
                         update_progress(is_success, host, result["error"] if not is_success else "")
+                    except asyncio.TimeoutError:
+                        error_msg = f"HardTimeout: host did not complete within {HOST_HARD_TIMEOUT_S}s"
+                        print(f"⚠️  {host}: {error_msg}")
+                        update_progress(False, host, error_msg)
+                        await write_result_row(_make_error_result(rank, host, country, error_msg), output_headers)
                     except Exception as e:
                         error_msg = f"UNHANDLED: {type(e).__name__}: {e}"
                         update_progress(False, host, error_msg)
-                        error_row = {
-                            "rank": rank,
-                            "host": host,
-                            "country": country,
-                            "homepage_final_url": None,
-                            "homepage_status": None,
-                            "homepage_all_headers": None,
-                            "homepage_html_file": "",
-                            "first_internal_final_url": None,
-                            "first_internal_status": None,
-                            "first_internal_all_headers": None,
-                            "first_internal_html_file": "",
-                            "error": error_msg,
-                        }
-                        await write_result_row(error_row, output_headers)
+                        await write_result_row(_make_error_result(rank, host, country, error_msg), output_headers)
                     return
 
             tasks = [asyncio.create_task(bounded_scan(row)) for _, row in chunk_df.iterrows()]
             await asyncio.gather(*tasks)
 
-            # Close the browser after finishing this chunk
             await browser.close()
             print(f"--- Finished chunk, browser closed. ---")
 
