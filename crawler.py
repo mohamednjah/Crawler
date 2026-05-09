@@ -264,7 +264,7 @@ def get_successful_hosts() -> set:
 
     # Also treat hosts with at least 5 failed attempts as "successful" to stop retrying them
     for host, count in error_attempt_counts.items():
-        if host not in hosts_with_success and count >= 5:
+        if host not in hosts_with_success and count >= 3:
             hosts_with_success.add(host)
 
     return hosts_with_success
