@@ -16,11 +16,11 @@ from playwright.async_api import async_playwright
 # ========== CONFIGURATION ==========
 INPUT_CSV = "superlist/merged_global_country_superlist.csv"
 OUTPUT_CSV = "csp_scan_results.csv"
-HTML_DIR = Path("html_pages") 
+HTML_DIR = Path("html_pages")
 NAV_TIMEOUT_MS = 30000
 HEADLESS = True
 MAX_HOSTS = None
-MAX_CONCURRENT = 40
+MAX_CONCURRENT = 30
 
 # Realistic User-Agent for Chrome on Windows
 REAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
@@ -291,6 +291,7 @@ async def main():
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS,
+            executable_path="/snap/bin/chromium",
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=IsolateOrigins,site-per-process",
