@@ -323,6 +323,7 @@ async def main():
 
             browser = await p.chromium.launch(
                 headless=HEADLESS,
+                executable_path="/snap/bin/chromium",
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--disable-features=IsolateOrigins,site-per-process",
